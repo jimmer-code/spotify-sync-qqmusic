@@ -1,7 +1,7 @@
 # Spotify → QQ 音乐 每日同步 · Daily Sync
 
-把 Spotify 歌单单向镜像到 QQ 音乐同名歌单：每天增量跑；匹配必须有歌手证据；QQ 侧保持 Spotify 加入时间顺序。
-One-way mirror from a Spotify playlist to the same-named QQ Music playlist — runs daily; matches require artist evidence; QQ keeps Spotify added-time order.
+默认把 Spotify 歌单单向镜像到 QQ 音乐和 Apple Music 同名歌单；设置 `SYNC_DIRECTION=bidirectional` 后，QQ 音乐的新增/删除也会同步回 Spotify。每天增量跑；匹配必须有歌手证据；QQ 侧保持 Spotify 加入时间顺序。
+By default the tool mirrors Spotify playlists to same-named QQ Music and Apple Music playlists. Set `SYNC_DIRECTION=bidirectional` to propagate QQ additions/deletions back to Spotify. Runs incrementally; matches require artist evidence; QQ keeps Spotify added-time order.
 
 ## 流程 · Flow
 
@@ -46,6 +46,7 @@ cp .env.example .env        # 复制配置
 
 make bootstrap-spotify      # 一次性 Spotify OAuth，打印 refresh token
 make bootstrap-qq           # 一次性 QQ 扫码登录（手机 QQ 扫），打印 QQ_CREDENTIAL_JSON
+# Apple Music: `uv run spotify-sync bootstrap-apple`，在本地浏览器页完成登录
 # 把上面两个产物写回 .env
 
 uv run spotify-sync playlists -s "源歌单" -q "目标歌单"
@@ -107,7 +108,7 @@ make test                           # 快捷方式
 
 增量靠 `playlist_snapshot` 表记录上次成功同步后的 Spotify track id 集合；下次对比得出 `added / kept / removed`。只有新且未知的 track 走 QQ 搜索；命中过 `track_map_cache` 的直接复用 QQ 映射；命中过 `unmatched_tracks` 的默认跳过不重试；`removed` 用缓存映射反查 QQ id。
 
-日常同步只做差量删除/新增；新增会按 Spotify `added_at` 升序写入 QQ。QQ 音乐按“添加时间倒序”显示时，最上面就是 Spotify 最新加入的歌。只有检测到 QQ 侧顺序已经漂移、差量写入无法修正时，才会触发安全阀保护下的顺序重建。
+日常同步只做差量删除/新增；新增会按 Spotify `added_at` 升序写入 QQ。QQ 音乐按“添加时间倒序”显示时，最上面就是 Spotify 最新加入的歌。只有检测到 QQ 侧顺序已经漂移、差量写入无法修正时，才会触发安全阀保护下的顺序重建。双向模式下，无法可靠反查到 Spotify 的 QQ 歌曲会保留在 QQ 侧并写入 `unmatched.txt`，不会被误删。
 
 ## Title-only 兜底 · Fallback
 
@@ -136,10 +137,13 @@ Primary search is `title + artist`. On miss (<0.8), retry with just `title`; unl
 |---|---|
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | Spotify 开发者后台 |
 | `SPOTIFY_REFRESH_TOKEN` | `bootstrap-spotify` 生成 |
-| `SPOTIFY_PLAYLIST_NAME` / `QQ_PLAYLIST_NAME` | 源/目标歌单名 |
+| `SPOTIFY_PLAYLIST_NAME` / `QQ_PLAYLIST_NAME` | 单歌单命令使用的源/目标歌单名 |
+| `SYNC_DIRECTION` | `spotify-to-qq`（默认）或 `bidirectional`；双向模式需要 Spotify 修改歌单权限 |
+| `SPOTIFY_PLAYLIST_NAMES` | daemon 要持续同步的 Spotify 歌单名，逗号分隔；每个目标歌单使用相同名称 |
 | `QQ_CREDENTIAL_JSON` | `bootstrap-qq` 生成（单行 JSON） |
+| `APPLE_MUSIC_MEDIA_USER_TOKEN` | `bootstrap-apple` 生成，供 Apple Music Web playlist 写入 |
 | `MIRROR_DELETE_THRESHOLD` | 镜像安全阀（默认 `0.2`，超出直接 abort） |
-| `GH_PAT_SECRETS_WRITE` | 可选，fine-grained PAT，权限 `secrets:write`，给 Actions 自动刷新 `QQ_CREDENTIAL_JSON` 用 |
+| `GH_PAT_SECRETS_WRITE` | 可选，fine-grained PAT，权限 `secrets:write`，给 Actions 自动保存轮换后的 Spotify/QQ 凭证 |
 
 ## GitHub Actions
 
@@ -153,6 +157,8 @@ Primary search is `title + artist`. On miss (<0.8), retry with just `title`; unl
 配好后每天 UTC 11:00（北京 19:00）自动跑；Actions 页面手点 `Run workflow` 可触发 dry-run。
 CI 使用 `uv sync --frozen` 严格按 `uv.lock` 装依赖 → 本地和线上版本完全一致。
 产物：`data/` 分支自动 commit 回 SQLite + 日志；`sync.log` + `unmatched.txt` 作 30 天 artifact。
+
+Spotify 换取 access token 时如果返回新的 refresh token，程序会自动更新本地 `.env`；配置 `GH_PAT_SECRETS_WRITE` 后，GitHub Actions 也会自动更新 `SPOTIFY_REFRESH_TOKEN` Secret。若 refresh token 已被 Spotify 撤销，仍需重新运行 OAuth bootstrap。
 
 ## 常见问题 · Troubleshooting
 

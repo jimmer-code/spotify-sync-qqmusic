@@ -22,7 +22,9 @@ from src import sync_service as svc
 from src.config import Config
 
 
-def _cfg(tmpdir: str, threshold: float = 0.2) -> Config:
+def _cfg(
+    tmpdir: str, threshold: float = 0.2, direction: str = "spotify-to-qq"
+) -> Config:
     return Config(
         spotify_client_id="cid",
         spotify_client_secret="csec",
@@ -30,6 +32,7 @@ def _cfg(tmpdir: str, threshold: float = 0.2) -> Config:
         spotify_playlist_name="测试同步",
         qq_playlist_name="测试同步",
         qq_credential_json='{"musicid": 1, "musickey": "K"}',
+        sync_direction=direction,
         gh_pat_secrets_write=None,
         mirror_delete_threshold=threshold,
         db_path=os.path.join(tmpdir, "sync.db"),
@@ -107,6 +110,25 @@ class TestRunSync(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
+
+    def test_persists_rotated_spotify_refresh_token(self):
+        sp = MagicMock()
+        sp.refresh_token_rotated = True
+        sp.refresh_token = "RT_NEW"
+        cfg = _cfg(self.tmpdir)
+        notes: list[str] = []
+
+        with patch.object(
+            svc, "_persist_local_env_var", return_value=(True, "local .env updated")
+        ) as local, patch.object(
+            svc, "_push_secret_if_possible", return_value=(True, "secret rotated")
+        ) as github:
+            svc._persist_spotify_refresh_token_if_rotated(sp, cfg, notes)
+
+        local.assert_called_once_with("SPOTIFY_REFRESH_TOKEN", "RT_NEW")
+        github.assert_called_once_with("SPOTIFY_REFRESH_TOKEN", "RT_NEW", cfg)
+        assert sp.refresh_token_rotated is False
+        assert "spotify_refresh_token_rotated=local+github" in notes[0]
 
     def _patches(
         self,
@@ -207,6 +229,75 @@ class TestRunSync(unittest.TestCase):
         qq_second.add_songs.assert_called_once()
         _, add_pairs = qq_second.add_songs.call_args.args
         self.assertEqual(add_pairs, [(202, 0)])
+
+    def test_bidirectional_qq_addition_is_added_to_spotify(self):
+        old_sp = _sp_track("old", "Old", "X", added_at="2024-01-01T00:00:00Z")
+        new_sp = _sp_track("new", "New", "Y", duration_ms=200000)
+        old_qq = _qq_cand(101, "Old", "X", 200, 0)
+        new_qq = _qq_cand(202, "New", "Y", 200, 0)
+        search_map = {"Old X": [old_qq]}
+        cfg = _cfg(self.tmpdir, direction="bidirectional")
+
+        sp = _make_sp_mock([old_sp])
+        qq_first = _make_qq_mock([], search_map)
+        patches = self._patches(sp, qq_first)
+        for p in patches:
+            p.start()
+        try:
+            self.assertEqual(svc.run_sync(cfg), 0)
+        finally:
+            for p in patches:
+                p.stop()
+
+        sp.get_playlist_tracks.return_value = [old_sp]
+        sp.search_track.return_value = [new_sp]
+        qq_second = _make_qq_mock([old_qq, new_qq], search_map)
+        patches = self._patches(sp, qq_second)
+        for p in patches:
+            p.start()
+        try:
+            self.assertEqual(svc.run_sync(cfg), 0)
+        finally:
+            for p in patches:
+                p.stop()
+
+        sp.add_tracks.assert_called_once_with("pl1", ["new"])
+        sp.remove_tracks.assert_not_called()
+        qq_second.add_songs.assert_not_called()
+        qq_second.del_songs.assert_not_called()
+
+    def test_bidirectional_qq_deletion_is_removed_from_spotify(self):
+        old_sp = _sp_track("old", "Old", "X", added_at="2024-01-01T00:00:00Z")
+        old_qq = _qq_cand(101, "Old", "X", 200, 0)
+        search_map = {"Old X": [old_qq]}
+        cfg = _cfg(self.tmpdir, threshold=1.0, direction="bidirectional")
+
+        sp = _make_sp_mock([old_sp])
+        qq_first = _make_qq_mock([], search_map)
+        patches = self._patches(sp, qq_first)
+        for p in patches:
+            p.start()
+        try:
+            self.assertEqual(svc.run_sync(cfg), 0)
+        finally:
+            for p in patches:
+                p.stop()
+
+        sp.get_playlist_tracks.return_value = [old_sp]
+        qq_second = _make_qq_mock([], search_map)
+        patches = self._patches(sp, qq_second)
+        for p in patches:
+            p.start()
+        try:
+            self.assertEqual(svc.run_sync(cfg), 0)
+        finally:
+            for p in patches:
+                p.stop()
+
+        sp.remove_tracks.assert_called_once_with("pl1", ["old"])
+        sp.add_tracks.assert_not_called()
+        qq_second.add_songs.assert_not_called()
+        qq_second.del_songs.assert_not_called()
 
     def test_order_drift_rebuilds_playlist(self):
         sp_tracks = [

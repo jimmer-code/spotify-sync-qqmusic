@@ -23,6 +23,7 @@ class SpotifyClient:
         self.client_id = client_id
         self.client_secret = client_secret
         self.refresh_token = refresh_token
+        self.refresh_token_rotated = False
         self._access_token: str | None = None
         self._token_expires_at: float = 0.0
 
@@ -39,6 +40,10 @@ class SpotifyClient:
         resp.raise_for_status()
         body = resp.json()
         self._access_token = body["access_token"]
+        new_refresh_token = body.get("refresh_token")
+        if new_refresh_token and new_refresh_token != self.refresh_token:
+            self.refresh_token = str(new_refresh_token)
+            self.refresh_token_rotated = True
         self._token_expires_at = time.time() + int(body.get("expires_in", 3600)) - 60
         return self._access_token
 
@@ -66,6 +71,39 @@ class SpotifyClient:
             return resp.json()
         raise RuntimeError("exhausted retries")
 
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+    ) -> dict[str, Any]:
+        for attempt in range(MAX_RETRIES + 1):
+            headers = self._auth_header()
+            if json_body is not None:
+                headers["Content-Type"] = "application/json"
+            resp = requests.request(
+                method, url, headers=headers, params=params, json=json_body, timeout=30
+            )
+            if resp.status_code == 429:
+                if attempt >= MAX_RETRIES:
+                    resp.raise_for_status()
+                retry_after = int(resp.headers.get("Retry-After", "1"))
+                backoff = retry_after * (2 ** attempt)
+                time.sleep(backoff)
+                continue
+            if resp.status_code == 401 and attempt == 0:
+                self._refresh_access_token()
+                continue
+            resp.raise_for_status()
+            if not resp.content:
+                return {}
+            try:
+                return resp.json()
+            except ValueError:
+                return {}
+        raise RuntimeError("exhausted retries")
+
     def list_playlists(self) -> list[dict[str, Any]]:
         """Return the user's Spotify playlists (paginated through `next`)."""
         out: list[dict[str, Any]] = []
@@ -83,6 +121,71 @@ class SpotifyClient:
             if pl.get("name") == name:
                 return pl
         return None
+
+    def get_current_user_id(self) -> str:
+        body = self._get(f"{API_BASE}/me")
+        uid = body.get("id")
+        if not uid:
+            raise RuntimeError("no user id in /me response")
+        return uid
+
+    def search_track(
+        self, title: str, artist: str = "", limit: int = 5
+    ) -> list[dict[str, Any]]:
+        q_parts = [f'track:"{title}"'] if title else []
+        if artist:
+            q_parts.append(f'artist:"{artist}"')
+        q = " ".join(q_parts) or title
+        body = self._get(
+            f"{API_BASE}/search",
+            params={"q": q, "type": "track", "limit": limit},
+        )
+        items = ((body.get("tracks") or {}).get("items")) or []
+        return [_normalize_track(t) for t in items]
+
+    def create_playlist(
+        self, user_id: str, name: str, public: bool = True, description: str = ""
+    ) -> dict[str, Any]:
+        # `user_id` kept for backwards compat; the Feb 2026 endpoint is /me/playlists.
+        # The legacy /users/{user_id}/playlists path returns 403 for dev-mode apps.
+        del user_id
+        return self._request_json(
+            "POST",
+            f"{API_BASE}/me/playlists",
+            json_body={"name": name, "public": public, "description": description},
+        )
+
+    def add_tracks(self, playlist_id: str, track_ids: list[str]) -> None:
+        """Add tracks in batches of 100 (Spotify limit).
+
+        Feb 2026: endpoint moved from /tracks to /items.
+        """
+        for i in range(0, len(track_ids), 100):
+            batch = track_ids[i : i + 100]
+            uris = [f"spotify:track:{tid}" for tid in batch]
+            self._request_json(
+                "POST",
+                f"{API_BASE}/playlists/{playlist_id}/items",
+                json_body={"uris": uris},
+            )
+
+    def remove_tracks(self, playlist_id: str, track_ids: list[str]) -> None:
+        """Remove tracks in batches of 100 (Spotify limit)."""
+        for i in range(0, len(track_ids), 100):
+            batch = track_ids[i : i + 100]
+            items = [{"uri": f"spotify:track:{tid}"} for tid in batch]
+            self._request_json(
+                "DELETE",
+                f"{API_BASE}/playlists/{playlist_id}/items",
+                json_body={"items": items},
+            )
+
+    def get_playlist_meta(self, playlist_id: str) -> dict[str, Any]:
+        """Fetch lightweight playlist metadata (e.g. snapshot_id, name, total tracks)."""
+        return self._get(
+            f"{API_BASE}/playlists/{playlist_id}",
+            params={"fields": "id,name,snapshot_id,tracks.total"},
+        )
 
     def get_playlist_tracks(self, playlist_id: str) -> list[dict[str, Any]]:
         url: str | None = f"{API_BASE}/playlists/{playlist_id}/items"

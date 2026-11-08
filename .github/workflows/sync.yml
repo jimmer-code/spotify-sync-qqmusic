@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Preview without mutating QQ playlist"
+        description: "Preview without mutating either playlist"
         type: boolean
         default: false
 
@@ -62,6 +62,7 @@ jobs:
           SPOTIFY_PLAYLIST_NAME: ${{ secrets.SPOTIFY_PLAYLIST_NAME }}
           QQ_PLAYLIST_NAME: ${{ secrets.QQ_PLAYLIST_NAME }}
           QQ_CREDENTIAL_JSON: ${{ secrets.QQ_CREDENTIAL_JSON }}
+          SYNC_DIRECTION: ${{ vars.SYNC_DIRECTION }}
           GH_PAT_SECRETS_WRITE: ${{ secrets.GH_PAT_SECRETS_WRITE }}
           GH_TOKEN: ${{ secrets.GH_PAT_SECRETS_WRITE }}
           MIRROR_DELETE_THRESHOLD: ${{ vars.MIRROR_DELETE_THRESHOLD }}

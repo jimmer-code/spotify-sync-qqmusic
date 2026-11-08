@@ -144,14 +144,15 @@ class QQClient:
 
         return _run(_do())
 
-    def search_song(self, keyword: str, num: int = 10) -> list[dict[str, Any]]:
+    def search_song(self, keyword: str, limit: int = 10, num: int | None = None) -> list[dict[str, Any]]:
         """Search songs by keyword. Returns normalized candidates."""
+        actual_num = num if num is not None else limit
 
         async def _do() -> list[dict[str, Any]]:
             client = self._client()
             try:
                 resp = await client.search.search_by_type(
-                    keyword=keyword, search_type=SearchType.SONG, num=num
+                    keyword=keyword, search_type=SearchType.SONG, num=actual_num
                 )
                 return [
                     {

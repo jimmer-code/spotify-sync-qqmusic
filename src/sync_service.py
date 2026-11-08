@@ -1,4 +1,4 @@
-"""Orchestrator: Spotify -> QQ Music mirror sync.
+"""Orchestrator for Spotify/QQ Music playlist reconciliation.
 
 Wires together the clients, matcher, diff engine, DB, and report writers
 to execute the 9-step flow from the plan. Returns an exit code suitable
@@ -86,8 +86,38 @@ def _search_query(track: dict[str, Any]) -> str:
     return f"{title} {artist}".strip()
 
 
-def _push_qq_secret_if_possible(new_blob: str, cfg: Config) -> tuple[bool, str]:
-    """Push rotated `QQ_CREDENTIAL_JSON` to the GH secret. Never raise."""
+def _persist_local_env_var(key: str, value: str) -> tuple[bool, str]:
+    """Persist one rotated credential in the project `.env`, best-effort."""
+    env_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
+    )
+    if not os.path.exists(env_path):
+        return False, ".env not found"
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        prefix = f"{key}="
+        replaced = False
+        out: list[str] = []
+        for line in lines:
+            if line.startswith(prefix):
+                out.append(f"{prefix}{value}\n")
+                replaced = True
+            else:
+                out.append(line)
+        if not replaced:
+            out.append(f"{prefix}{value}\n")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(out)
+    except OSError as exc:
+        return False, f"local .env write failed: {exc}"
+    return True, "local .env updated"
+
+
+def _push_secret_if_possible(
+    secret_name: str, new_blob: str, cfg: Config
+) -> tuple[bool, str]:
+    """Push a rotated credential to a GH secret. Never raise."""
     if not cfg.gh_pat_secrets_write:
         return False, "no PAT configured"
     if shutil.which("gh") is None:
@@ -96,7 +126,7 @@ def _push_qq_secret_if_possible(new_blob: str, cfg: Config) -> tuple[bool, str]:
     env["GH_TOKEN"] = cfg.gh_pat_secrets_write
     try:
         proc = subprocess.run(
-            ["gh", "secret", "set", "QQ_CREDENTIAL_JSON", "--body", new_blob],
+            ["gh", "secret", "set", secret_name, "--body", new_blob],
             env=env,
             capture_output=True,
             text=True,
@@ -107,6 +137,42 @@ def _push_qq_secret_if_possible(new_blob: str, cfg: Config) -> tuple[bool, str]:
     if proc.returncode != 0:
         return False, f"gh secret set rc={proc.returncode}: {proc.stderr.strip()}"
     return True, "secret rotated"
+
+
+def _push_qq_secret_if_possible(new_blob: str, cfg: Config) -> tuple[bool, str]:
+    """Backward-compatible wrapper for the QQ credential secret."""
+    return _push_secret_if_possible("QQ_CREDENTIAL_JSON", new_blob, cfg)
+
+
+def _persist_spotify_refresh_token_if_rotated(
+    sp: SpotifyClient, cfg: Config, notes_parts: list[str]
+) -> None:
+    """Persist a refresh-token rotation without making sync fail."""
+    if getattr(sp, "refresh_token_rotated", False) is not True:
+        return
+    local_ok, local_msg = _persist_local_env_var(
+        "SPOTIFY_REFRESH_TOKEN", sp.refresh_token
+    )
+    gh_ok, gh_msg = _push_secret_if_possible(
+        "SPOTIFY_REFRESH_TOKEN", sp.refresh_token, cfg
+    )
+    destinations: list[str] = []
+    if local_ok:
+        destinations.append("local")
+    if gh_ok:
+        destinations.append("github")
+    if not destinations:
+        destinations.append("none")
+    notes_parts.append(
+        f"spotify_refresh_token_rotated={'+'.join(destinations)} "
+        f"(local: {local_msg}; github: {gh_msg})"
+    )
+    _log(
+        "      -> Spotify refresh token rotated; "
+        f"persisted to {', '.join(destinations)}"
+    )
+    if destinations:
+        sp.refresh_token_rotated = False
 
 
 def _cache_row_for(
@@ -131,6 +197,8 @@ def _cache_row_for(
 
 
 def _qq_pair_from_cache(row: Any) -> tuple[int, int] | None:
+    if row is None:
+        return None
     song_id = row["qq_song_id"]
     song_type = row["qq_song_type"]
     if song_id is None or song_type is None:
@@ -393,11 +461,90 @@ def _match_title_only_fallback(
     return None, overall_score, overall_method
 
 
+def _match_qq_to_spotify(
+    song: dict[str, Any],
+    spotify: SpotifyClient,
+    qq: QQClient,
+    alias_client: MusicBrainzClient,
+) -> tuple[dict[str, Any] | None, float, str]:
+    """Find a confident Spotify track for a QQ song.
+
+    The matcher is deliberately shared with the Spotify -> QQ direction: the
+    normalized QQ song is the source track and Spotify search results are the
+    candidates.  Title-only retries still require artist evidence (including
+    cached cross-language aliases) before a write is allowed.
+    """
+    source = dict(song)
+    title = (song.get("title") or song.get("name") or "").strip()
+    artists = song.get("artists") or song.get("artist") or []
+    artist = _primary_artist({"artists": artists})
+    if not title:
+        return None, 0.0, "none"
+
+    try:
+        primary = spotify.search_track(title, artist, limit=10)
+    except Exception as exc:  # pragma: no cover - defensive network guard
+        _log(f"    ↻ Spotify 搜索失败 {title!r}: {exc}")
+        primary = []
+    if not isinstance(primary, list):
+        primary = []
+    all_candidates = list(primary)
+
+    best, best_score, best_method = pick_best(source, primary, threshold=0.8)
+    if best is not None:
+        return best, best_score, best_method
+
+    overall_cand, overall_score, overall_method = _best_scored_candidate(
+        source, primary
+    )
+    for query in _fallback_title_queries(source):
+        if query == title:
+            continue
+        try:
+            candidates = spotify.search_track(query, limit=10)
+        except Exception as exc:  # pragma: no cover - defensive network guard
+            _log(f"    ↻ Spotify 标题搜索失败 {query!r}: {exc}")
+            continue
+        if not isinstance(candidates, list):
+            continue
+        all_candidates.extend(candidates)
+        score_source = _track_with_title(source, query)
+        for candidate in candidates:
+            score, method = score_candidate(score_source, candidate)
+            if overall_cand is None or score > overall_score:
+                overall_cand = candidate
+                overall_score = score
+                overall_method = f"title-only|{method}"
+
+    if overall_cand is not None and is_confident_match(
+        source, overall_cand, overall_score
+    ):
+        return overall_cand, overall_score, overall_method
+
+    if overall_cand is not None and overall_score >= 0.8:
+        alias_source = _with_artist_aliases(source, qq, alias_client)
+        if alias_source is not source:
+            for candidate in all_candidates:
+                score, method = score_candidate(alias_source, candidate)
+                if score > overall_score:
+                    overall_cand = candidate
+                    overall_score = score
+                    overall_method = method
+            if overall_cand is not None and is_confident_match(
+                alias_source, overall_cand, overall_score
+            ):
+                return overall_cand, overall_score, overall_method
+
+    return None, overall_score, overall_method
+
+
 def run_sync(cfg: Config, dry_run: bool = False, full: bool = False) -> int:
     """Execute one sync run. Returns 0 on success, non-zero on failure.
 
     `full=True` bypasses the incremental snapshot so every Spotify track is
-    re-searched (useful after cache drift or manual QQ edits).
+    re-searched (useful after cache drift or manual QQ edits).  When
+    ``cfg.sync_direction`` is ``bidirectional``, QQ additions/deletions are
+    reconciled back to Spotify after the forward matching pass.
     """
     os.makedirs(os.path.dirname(os.path.abspath(cfg.db_path)) or ".", exist_ok=True)
 
@@ -415,6 +562,8 @@ def run_sync(cfg: Config, dry_run: bool = False, full: bool = False) -> int:
     t_start = time.time()
     try:
         mode = "full" if full else "incremental"
+        bidirectional = cfg.sync_direction == "bidirectional"
+        notes_parts.append(f"direction={cfg.sync_direction}")
         _log(f"[1/9] fetching Spotify playlist {cfg.spotify_playlist_name!r} (mode={mode})...")
         sp = SpotifyClient(
             cfg.spotify_client_id,
@@ -435,6 +584,7 @@ def run_sync(cfg: Config, dry_run: bool = False, full: bool = False) -> int:
         _log(f"      -> {len(sp_tracks)} tracks")
         notes_parts.append(f"spotify_count={len(sp_tracks)}")
         notes_parts.append(f"mode={mode}")
+        _persist_spotify_refresh_token_if_rotated(sp, cfg, notes_parts)
 
         _log("[2/9] refreshing QQ credential...")
         credential = load_credential(cfg.qq_credential_json)
@@ -459,6 +609,7 @@ def run_sync(cfg: Config, dry_run: bool = False, full: bool = False) -> int:
         notes_parts.append(f"qq_count={len(qq_current)}")
 
         _log(f"[4/9] building incremental plan (full={full})...")
+        prior_snapshot = dbm.snapshot_get(conn, spotify_playlist_id)
         plan = incremental.build_plan(
             conn, spotify_playlist_id, sp_tracks, dirid, full
         )
@@ -561,14 +712,160 @@ def run_sync(cfg: Config, dry_run: bool = False, full: bool = False) -> int:
             f"本次搜到 {searched - len(unmatched_rows) - failed_count}), 未匹配 {len(unmatched_rows)}"
         )
 
-        ordered_target_pairs = _ordered_unique_pairs(sp_tracks, matched)
+        spotify_ids_before_reverse = {
+            str(track.get("id"))
+            for track in sp_tracks
+            if track.get("id") is not None
+        }
+        spotify_ids_to_add: list[str] = []
+        spotify_ids_to_remove: list[str] = []
+        bidirectional_unmatched: list[dict[str, Any]] = []
+        preserved_qq_pairs: list[tuple[int, int]] = []
 
-        _log("[6/9] computing mirror diff...")
+        if bidirectional:
+            _log("[6/9] checking QQ changes for reverse sync...")
+            prior_spotify_ids = set((prior_snapshot or {}).get("spotify_track_ids") or [])
+            current_qq_ids = set(_qq_current_ids(qq_current))
+            deleted_spotify_ids = prior_spotify_ids - spotify_ids_before_reverse
+            prior_cache_rows = dbm.cache_get_many(conn, prior_spotify_ids)
+            prior_qq_to_spotify = {
+                pair[0]: str(row["spotify_track_id"])
+                for row in prior_cache_rows.values()
+                if (pair := _qq_pair_from_cache(row)) is not None
+            }
+
+            # A cached mapping is evidence that this track was shipped by a
+            # previous successful run.  If QQ removed it, propagate that
+            # deletion to Spotify.  The prior snapshot guard prevents a first
+            # sync from interpreting an empty QQ playlist as mass deletion.
+            for track in sp_tracks:
+                sp_id = track.get("id")
+                if sp_id is None or str(sp_id) not in prior_spotify_ids:
+                    continue
+                row = prior_cache_rows.get(str(sp_id))
+                pair = _qq_pair_from_cache(row)
+                if pair is not None and pair[0] not in current_qq_ids:
+                    spotify_ids_to_remove.append(str(sp_id))
+
+            mapped_qq_ids = {
+                pair[0]
+                for _track, pair in matched
+                if pair[0] in current_qq_ids
+            }
+            seen_reverse_spotify_ids = set(spotify_ids_before_reverse)
+            for song in qq_current:
+                pair = _qq_pair_from_song(song)
+                if pair is None or pair[0] in mapped_qq_ids:
+                    continue
+
+                # If Spotify removed this mapped song since the last snapshot,
+                # keep the deletion one-way for this conflict and let the
+                # existing QQ diff remove it below.
+                cached_sp_id = prior_qq_to_spotify.get(pair[0])
+                if cached_sp_id in deleted_spotify_ids:
+                    continue
+
+                candidate, score, method = _match_qq_to_spotify(
+                    song, sp, qq, alias_client
+                )
+                if candidate is None or candidate.get("id") is None:
+                    bidirectional_unmatched.append(
+                        {
+                            "title": song.get("title", ""),
+                            "artist": _primary_artist(song),
+                            "qq_song_id": pair[0],
+                            "reason": f"Spotify reverse match {int(round(score * 100))}% ({method})",
+                        }
+                    )
+                    preserved_qq_pairs.append(pair)
+                    continue
+
+                sp_id = str(candidate["id"])
+                if sp_id in seen_reverse_spotify_ids:
+                    preserved_qq_pairs.append(pair)
+                    continue
+
+                candidate = dict(candidate)
+                candidate["added_at"] = None
+                dbm.cache_put(conn, _cache_row_for(candidate, song, score, method))
+                matched.append((candidate, pair))
+                mapped_qq_ids.add(pair[0])
+                seen_reverse_spotify_ids.add(sp_id)
+                if sp_id not in spotify_ids_before_reverse:
+                    spotify_ids_to_add.append(sp_id)
+                    sp_tracks.append(candidate)
+
+            # The QQ side is allowed to retain songs that cannot be mapped
+            # safely.  This is the key difference from the legacy mirror mode:
+            # a failed reverse lookup never causes a destructive QQ delete.
+            notes_parts.append(
+                f"reverse: add_spotify={len(spotify_ids_to_add)} "
+                f"remove_spotify={len(spotify_ids_to_remove)} "
+                f"unmatched_qq={len(bidirectional_unmatched)}"
+            )
+            if bidirectional_unmatched:
+                _log(
+                    f"      -> preserved {len(bidirectional_unmatched)} QQ song(s) "
+                    "without a confident Spotify match"
+                )
+            spotify_ids_to_add = list(dict.fromkeys(spotify_ids_to_add))
+            spotify_ids_to_remove = list(dict.fromkeys(spotify_ids_to_remove))
+        else:
+            _log("[6/9] computing mirror diff...")
+
+        spotify_ids_to_remove_set = set(spotify_ids_to_remove)
+        # Keep the Spotify playlist order while deduplicating the filtered
+        # mapping.  Reverse additions are appended to ``sp_tracks`` above.
+        ordered_target_pairs = _ordered_unique_pairs(
+            [
+                track
+                for track in sp_tracks
+                if str(track.get("id")) not in spotify_ids_to_remove_set
+            ],
+            [
+                (track, pair)
+                for track, pair in matched
+                if str(track.get("id")) not in spotify_ids_to_remove_set
+            ],
+        )
+        if bidirectional:
+            seen_target_ids = {pair[0] for pair in ordered_target_pairs}
+            for pair in preserved_qq_pairs:
+                if pair[0] not in seen_target_ids:
+                    ordered_target_pairs.append(pair)
+                    seen_target_ids.add(pair[0])
+            for row in bidirectional_unmatched:
+                unmatched_rows.append(
+                    {
+                        "spotify_track_id": f"qq:{row['qq_song_id']}",
+                        "title": row["title"],
+                        "artist": row["artist"],
+                        "album": "",
+                        "reason": row["reason"],
+                    }
+                )
+
         target_qq_ids = {pair[0] for pair in ordered_target_pairs}
         current_order_ids = _qq_current_ids(qq_current)
         current_qq_ids = set(current_order_ids)
         diff = compute_mirror_diff(target_qq_ids, current_qq_ids)
         safe, diff_safety_msg = safety_check(diff, len(current_qq_ids), cfg.mirror_delete_threshold)
+        reverse_safety_msg = ""
+        if bidirectional and spotify_ids_to_remove:
+            prior_count = len((prior_snapshot or {}).get("spotify_track_ids") or [])
+            reverse_ratio = len(spotify_ids_to_remove) / max(1, prior_count)
+            if reverse_ratio > cfg.mirror_delete_threshold:
+                safe = False
+                reverse_safety_msg = (
+                    f"reverse threshold exceeded: would remove "
+                    f"{len(spotify_ids_to_remove)}/{prior_count} "
+                    f"({reverse_ratio:.2%} > {cfg.mirror_delete_threshold:.2%})"
+                )
+            else:
+                reverse_safety_msg = (
+                    f"reverse remove {len(spotify_ids_to_remove)}/{prior_count} "
+                    f"({reverse_ratio:.2%} <= {cfg.mirror_delete_threshold:.2%})"
+                )
 
         to_add_pairs = [pair for pair in ordered_target_pairs if pair[0] in diff["to_add"]]
         # For removal we fuse snapshot-driven removals with mirror-diff removals.
@@ -618,10 +915,13 @@ def run_sync(cfg: Config, dry_run: bool = False, full: bool = False) -> int:
 
         _log(
             f"      -> add {len(to_add_pairs)}, remove {len(to_remove_pairs)} "
-            f"(mode: {write_mode}; safety: {diff_safety_msg}; {rebuild_safety_msg})"
+            f"(mode: {write_mode}; safety: {diff_safety_msg}; {rebuild_safety_msg}"
+            f"{'; ' + reverse_safety_msg if reverse_safety_msg else ''})"
         )
         notes_parts.append(
-            f"write_mode={write_mode}; safety={diff_safety_msg}; {rebuild_safety_msg}"
+            f"write_mode={write_mode}; safety={diff_safety_msg}; {rebuild_safety_msg}; "
+            f"spotify_add={len(spotify_ids_to_add)} spotify_remove={len(spotify_ids_to_remove)}"
+            f"{'; ' + reverse_safety_msg if reverse_safety_msg else ''}"
         )
 
         skipped_count += len(unmatched_rows)
@@ -718,6 +1018,40 @@ def run_sync(cfg: Config, dry_run: bool = False, full: bool = False) -> int:
                     f"incremental_apply: deleted={removed_count} "
                     f"added={added_count}"
                 )
+
+            if bidirectional:
+                if spotify_ids_to_remove:
+                    _log(
+                        f"[7/9] removing {len(spotify_ids_to_remove)} track(s) from Spotify..."
+                    )
+                    try:
+                        sp.remove_tracks(spotify_playlist_id, spotify_ids_to_remove)
+                        _log("      -> Spotify removals applied")
+                    except Exception as exc:  # pragma: no cover - network guard
+                        failed_count += len(spotify_ids_to_remove)
+                        notes_parts.append(f"spotify remove failed: {exc}")
+                        _log(f"      -> FAILED: Spotify remove_tracks: {exc}")
+                if spotify_ids_to_add:
+                    _log(
+                        f"[7/9] adding {len(spotify_ids_to_add)} track(s) to Spotify..."
+                    )
+                    try:
+                        sp.add_tracks(spotify_playlist_id, spotify_ids_to_add)
+                        _log("      -> Spotify additions applied")
+                    except Exception as exc:  # pragma: no cover - network guard
+                        failed_count += len(spotify_ids_to_add)
+                        notes_parts.append(f"spotify add failed: {exc}")
+                        _log(f"      -> FAILED: Spotify add_tracks: {exc}")
+                # The list is used as the next snapshot only after all writes
+                # succeed.  Filtering removals here also keeps a successful
+                # reverse delete from being resurrected by the next run.
+                if not failed_count:
+                    sp_tracks = [
+                        track
+                        for track in sp_tracks
+                        if str(track.get("id")) not in spotify_ids_to_remove_set
+                    ]
+            _persist_spotify_refresh_token_if_rotated(sp, cfg, notes_parts)
             status = "failed" if failed_count else "success"
 
             if status == "success":

@@ -44,6 +44,9 @@ class Config:
     spotify_playlist_name: str
     qq_playlist_name: str
     qq_credential_json: str
+    sync_direction: str = "spotify-to-qq"
+    sync_playlist_names: tuple[str, ...] = ()
+    apple_music_media_user_token: str | None = None
     gh_pat_secrets_write: str | None = None
     mirror_delete_threshold: float = 0.2
     db_path: str = "data/sync.db"
@@ -90,6 +93,21 @@ def load_config() -> Config:
             f"MIRROR_DELETE_THRESHOLD 必须是小数，现在是 {threshold_raw!r}"
         ) from exc
 
+    sync_direction = (os.environ.get("SYNC_DIRECTION") or "spotify-to-qq").strip().lower()
+    if sync_direction not in {"spotify-to-qq", "bidirectional"}:
+        raise ConfigError(
+            "SYNC_DIRECTION 必须是 spotify-to-qq 或 bidirectional，"
+            f"现在是 {sync_direction!r}"
+        )
+
+    sync_playlist_names = tuple(
+        dict.fromkeys(
+            name.strip()
+            for name in os.environ.get("SPOTIFY_PLAYLIST_NAMES", "").split(",")
+            if name.strip()
+        )
+    ) or (os.environ["SPOTIFY_PLAYLIST_NAME"],)
+
     return Config(
         spotify_client_id=os.environ["SPOTIFY_CLIENT_ID"],
         spotify_client_secret=os.environ["SPOTIFY_CLIENT_SECRET"],
@@ -97,6 +115,11 @@ def load_config() -> Config:
         spotify_playlist_name=os.environ["SPOTIFY_PLAYLIST_NAME"],
         qq_playlist_name=os.environ["QQ_PLAYLIST_NAME"],
         qq_credential_json=os.environ["QQ_CREDENTIAL_JSON"],
+        sync_direction=sync_direction,
+        sync_playlist_names=sync_playlist_names,
+        apple_music_media_user_token=(
+            os.environ.get("APPLE_MUSIC_MEDIA_USER_TOKEN") or None
+        ),
         gh_pat_secrets_write=os.environ.get("GH_PAT_SECRETS_WRITE") or None,
         mirror_delete_threshold=threshold,
         db_path=_anchor(os.environ.get("DB_PATH", "data/sync.db")),

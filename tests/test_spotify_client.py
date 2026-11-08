@@ -45,6 +45,24 @@ def test_refresh_access_token_sets_bearer(mock_post):
     assert kwargs["auth"] == ("cid", "csec")
 
 
+@patch("src.spotify_client.requests.post")
+def test_refresh_access_token_records_rotated_refresh_token(mock_post):
+    mock_post.return_value = _mock_response(
+        200,
+        {
+            "access_token": "AT123",
+            "refresh_token": "RT_NEW",
+            "expires_in": 3600,
+        },
+    )
+    c = SpotifyClient("cid", "csec", "RT_OLD")
+
+    c._refresh_access_token()
+
+    assert c.refresh_token == "RT_NEW"
+    assert c.refresh_token_rotated is True
+
+
 @patch("src.spotify_client.requests.get")
 @patch("src.spotify_client.requests.post")
 def test_find_playlist_by_name_paginates(mock_post, mock_get):
@@ -192,3 +210,25 @@ def test_normalize_track_carries_added_at():
         added_at="2024-05-07T01:02:03Z",
     )
     assert out["added_at"] == "2024-05-07T01:02:03Z"
+
+
+@patch("src.spotify_client.requests.request")
+@patch("src.spotify_client.requests.post")
+def test_remove_tracks_uses_items_endpoint(mock_post, mock_request):
+    mock_post.return_value = _mock_response(
+        200, {"access_token": "AT", "expires_in": 3600}
+    )
+    mock_request.return_value = _mock_response(200, {"snapshot_id": "snap"})
+
+    c = SpotifyClient("cid", "csec", "rt")
+    c.remove_tracks("PID", ["t1", "t2"])
+
+    args, kwargs = mock_request.call_args
+    assert args[0] == "DELETE"
+    assert args[1] == "https://api.spotify.com/v1/playlists/PID/items"
+    assert kwargs["json"] == {
+        "items": [
+            {"uri": "spotify:track:t1"},
+            {"uri": "spotify:track:t2"},
+        ]
+    }

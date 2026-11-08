@@ -15,7 +15,10 @@ REDIRECT_PORT = 8765
 REDIRECT_URI = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}/callback"
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
-SCOPES = "playlist-read-private playlist-read-collaborative"
+SCOPES = (
+    "playlist-read-private playlist-read-collaborative "
+    "playlist-modify-public playlist-modify-private"
+)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -58,6 +61,7 @@ def fetch_refresh_token(client_id: str, client_secret: str) -> str:
             "redirect_uri": REDIRECT_URI,
             "scope": SCOPES,
             "state": state,
+            "show_dialog": "true",
         }
     )
 
